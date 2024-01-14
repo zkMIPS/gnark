@@ -20,6 +20,7 @@
 package groth16
 
 import (
+	"github.com/consensys/gnark-crypto/ecc/bn254/fp"
 	"io"
 
 	"github.com/consensys/gnark-crypto/ecc"
@@ -109,9 +110,25 @@ type VerifyingKey interface {
 	IsDifferent(interface{}) bool
 }
 
+func PrintBn254Vk(vk VerifyingKey) {
+	groth16_bn254.PrintBn254Vk(vk.(*groth16_bn254.VerifyingKey))
+}
+
+func GetBn254Witness(proof Proof, vk VerifyingKey, publicWitness witness.Witness, opts ...backend.VerifierOption) (error, fr_bn254.Vector, fp.Element, fp.Element) {
+	switch _proof := proof.(type) {
+	case *groth16_bn254.Proof:
+		w, ok := publicWitness.Vector().(fr_bn254.Vector)
+		if !ok {
+			return witness.ErrInvalidWitness, nil, fp.NewElement(0), fp.NewElement(0)
+		}
+		return groth16_bn254.GetSolidityWitness(_proof, vk.(*groth16_bn254.VerifyingKey), w, opts...)
+	default:
+		panic("unrecognized R1CS curve type")
+	}
+}
+
 // Verify runs the groth16.Verify algorithm on provided proof with given witness
 func Verify(proof Proof, vk VerifyingKey, publicWitness witness.Witness, opts ...backend.VerifierOption) error {
-
 	switch _proof := proof.(type) {
 	case *groth16_bls12377.Proof:
 		w, ok := publicWitness.Vector().(fr_bls12377.Vector)

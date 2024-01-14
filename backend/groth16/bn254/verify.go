@@ -19,6 +19,7 @@ package groth16
 import (
 	"errors"
 	"fmt"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fp"
 	"io"
 	"text/template"
 	"time"
@@ -38,6 +39,122 @@ var (
 	errPairingCheckFailed         = errors.New("pairing doesn't match")
 	errCorrectSubgroupCheckFailed = errors.New("points in the proof are not in the correct subgroup")
 )
+
+func PrintBn254Vk(vk *VerifyingKey) {
+	fmt.Println("vk.alpha = Pairing.G1Point(uint256(", vk.G1.Alpha.X.String(), "), uint256(", vk.G1.Alpha.Y.String(), "));")
+	fmt.Println("vk.beta = Pairing.G2Point([uint256(", vk.G2.Beta.X.A0.String(), "), uint256(", vk.G2.Beta.X.A1.String(), ")], [uint256(", vk.G2.Beta.Y.A0.String(), "), uint256(", vk.G2.Beta.Y.A1.String(), ")]);")
+	fmt.Println("vk.gamma = Pairing.G2Point([uint256(", vk.G2.Gamma.X.A0.String(), "), uint256(", vk.G2.Gamma.X.A1.String(), ")], [uint256(", vk.G2.Gamma.Y.A0.String(), "), uint256(", vk.G2.Gamma.Y.A1.String(), ")]);")
+	fmt.Println("vk.delta = Pairing.G2Point([uint256(", vk.G2.Delta.X.A0.String(), "), uint256(", vk.G2.Delta.X.A1.String(), ")], [uint256(", vk.G2.Delta.Y.A0.String(), "), uint256(", vk.G2.Delta.Y.A1.String(), ")]);")
+	//vk.gamma_abc = new Pairing.G1Point[](2);
+	fmt.Println("vk.gamma_abc = new Pairing.G1Point[](", len(vk.G1.K), ");")
+	//vk.gamma_abc[0] = Pairing.G1Point(uint256(0x0412b6479c7c7cacb2c9bca7ad229ec17976c04300de385eb14ec7c96d72628a), uint256(0x2b86b6498ba46c1cef0e6c13580e29c0262cf8b256b8b9cfb319fc791cbf5bc3));
+
+	for k, v := range vk.G1.K {
+		fmt.Println("vk.gamma_abc[", k, "] = Pairing.G1Point(uint256(", v.X.String(), "), uint256(", v.Y.String(), "));")
+	}
+}
+
+func GetSolidityWitness(proof *Proof, vk *VerifyingKey, publicWitness fr.Vector, opts ...backend.VerifierOption) (error, fr.Vector, fp.Element, fp.Element) {
+	opt, err := backend.NewVerifierConfig(opts...)
+	if err != nil {
+		return fmt.Errorf("new verifier config: %w", err), nil, fp.NewElement(0), fp.NewElement(0)
+	}
+	if opt.HashToFieldFn == nil {
+		opt.HashToFieldFn = hash_to_field.New([]byte(constraint.CommitmentDst))
+	}
+
+	nbPublicVars := len(vk.G1.K) - len(vk.PublicAndCommitmentCommitted)
+
+	fmt.Printf("before len of publicWitness:%+v\n", len(publicWitness))
+	if len(publicWitness) != nbPublicVars-1 {
+		return fmt.Errorf("invalid witness size, got %d, expected %d (public - ONE_WIRE)", len(publicWitness), len(vk.G1.K)-1), nil, fp.NewElement(0), fp.NewElement(0)
+	}
+	log := logger.Logger().With().Str("curve", vk.CurveID().String()).Str("backend", "groth16").Logger()
+	start := time.Now()
+
+	// check that the points in the proof are in the correct subgroup
+	if !proof.isValid() {
+		return errCorrectSubgroupCheckFailed, nil, fp.NewElement(0), fp.NewElement(0)
+	}
+
+	var doubleML curve.GT
+	chDone := make(chan error, 1)
+
+	// compute (eKrsδ, eArBs)
+	go func() {
+		var errML error
+		doubleML, errML = curve.MillerLoop([]curve.G1Affine{proof.Krs, proof.Ar}, []curve.G2Affine{vk.G2.deltaNeg, proof.Bs})
+		chDone <- errML
+		close(chDone)
+	}()
+
+	maxNbPublicCommitted := 0
+	for _, s := range vk.PublicAndCommitmentCommitted { // iterate over commitments
+		maxNbPublicCommitted = utils.Max(maxNbPublicCommitted, len(s))
+	}
+	commitmentsSerialized := make([]byte, len(vk.PublicAndCommitmentCommitted)*fr.Bytes)
+	commitmentPrehashSerialized := make([]byte, curve.SizeOfG1AffineUncompressed+maxNbPublicCommitted*fr.Bytes)
+	for i := range vk.PublicAndCommitmentCommitted { // solveCommitmentWire
+		copy(commitmentPrehashSerialized, proof.Commitments[i].Marshal())
+		offset := curve.SizeOfG1AffineUncompressed
+		for j := range vk.PublicAndCommitmentCommitted[i] {
+			copy(commitmentPrehashSerialized[offset:], publicWitness[vk.PublicAndCommitmentCommitted[i][j]-1].Marshal())
+			offset += fr.Bytes
+		}
+		opt.HashToFieldFn.Write(commitmentPrehashSerialized[:offset])
+		hashBts := opt.HashToFieldFn.Sum(nil)
+		opt.HashToFieldFn.Reset()
+		nbBuf := fr.Bytes
+		if opt.HashToFieldFn.Size() < fr.Bytes {
+			nbBuf = opt.HashToFieldFn.Size()
+		}
+		var res fr.Element
+		res.SetBytes(hashBts[:nbBuf])
+		publicWitness = append(publicWitness, res)
+		copy(commitmentsSerialized[i*fr.Bytes:], res.Marshal())
+	}
+	fmt.Printf("after len of publicWitness:%+v\n", len(publicWitness))
+
+	if folded, err := pedersen.FoldCommitments(proof.Commitments, commitmentsSerialized); err != nil {
+		return err, nil, fp.NewElement(0), fp.NewElement(0)
+	} else {
+		if err = vk.CommitmentKey.Verify(folded, proof.CommitmentPok); err != nil {
+			return err, nil, fp.NewElement(0), fp.NewElement(0)
+		}
+	}
+
+	// compute e(Σx.[Kvk(t)]1, -[γ]2)
+	var kSum curve.G1Jac
+	if _, err := kSum.MultiExp(vk.G1.K[1:], publicWitness, ecc.MultiExpConfig{}); err != nil {
+		return err, nil, fp.NewElement(0), fp.NewElement(0)
+	}
+	kSum.AddMixed(&vk.G1.K[0])
+
+	for i := range proof.Commitments {
+		kSum.AddMixed(&proof.Commitments[i])
+	}
+
+	var kSumAff curve.G1Affine
+	kSumAff.FromJacobian(&kSum)
+
+	right, err := curve.MillerLoop([]curve.G1Affine{kSumAff}, []curve.G2Affine{vk.G2.gammaNeg})
+	if err != nil {
+		return err, nil, fp.NewElement(0), fp.NewElement(0)
+	}
+
+	// wait for (eKrsδ, eArBs)
+	if err := <-chDone; err != nil {
+		return err, nil, fp.NewElement(0), fp.NewElement(0)
+	}
+
+	right = curve.FinalExponentiation(&right, &doubleML)
+	if !vk.e.Equal(&right) {
+		return errPairingCheckFailed, nil, fp.NewElement(0), fp.NewElement(0)
+	}
+
+	log.Debug().Dur("took", time.Since(start)).Msg("verifier done")
+	return nil, publicWitness, proof.Commitments[0].X, proof.Commitments[0].Y
+}
 
 // Verify verifies a proof with given VerifyingKey and publicWitness
 func Verify(proof *Proof, vk *VerifyingKey, publicWitness fr.Vector, opts ...backend.VerifierOption) error {
